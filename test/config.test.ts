@@ -17,7 +17,7 @@ test("default config matches open-source defaults", () => {
   assert.equal(got.showIcons, true);
   assert.equal(got.debug, false);
   assert.equal(got.contextValue, "percent");
-  assert.equal(got.usageValue, "remaining");
+  assert.equal(got.usageValue, "percent");
 });
 
 test("load merges partial overrides", () => {
@@ -55,4 +55,22 @@ test("load uses first existing path", () => {
   fs.writeFileSync(second, `{"show_cwd":false}`);
 
   assert.equal(loadFromPaths([first, second]).showCWD, false);
+});
+
+test("load parses new quota layout and format options", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-hud-"));
+  const configPath = path.join(dir, "config.json");
+  try {
+    fs.writeFileSync(configPath, JSON.stringify({
+      quota_layout: "stacked",
+      reset_format: "duration",
+      show_plan_tier: false
+    }));
+    const config = loadFromPaths([configPath]);
+    assert.strictEqual(config.quotaLayout, "stacked");
+    assert.strictEqual(config.resetFormat, "duration");
+    assert.strictEqual(config.showPlanTier, false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

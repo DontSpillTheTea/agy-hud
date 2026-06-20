@@ -57,8 +57,10 @@ function defaultConfig() {
     showAgentState: true,
     showIcons: true,
     contextValue: "percent",
-    usageValue: "remaining",
-    debug: false
+    usageValue: "percent",
+    debug: false,
+    showAllQuotas: false,
+    resetFormat: "time"
   };
 }
 function loadFromPaths(paths) {
@@ -89,6 +91,8 @@ function merge(base, patch) {
   if (typeof patch.context_value === "string" && patch.context_value !== "") base.contextValue = patch.context_value;
   if (typeof patch.usage_value === "string" && patch.usage_value !== "") base.usageValue = patch.usage_value;
   if (typeof patch.debug === "boolean") base.debug = patch.debug;
+  if (typeof patch.show_all_quotas === "boolean") base.showAllQuotas = patch.show_all_quotas;
+  if (typeof patch.reset_format === "string" && patch.reset_format !== "") base.resetFormat = patch.reset_format;
   return base;
 }
 
@@ -140,6 +144,29 @@ function normalize(input) {
   }
   return out.trim().split(/\s+/).filter(Boolean).join(" ");
 }
+function pad2(n) {
+  if (n < 10) {
+    return `0${formatInt(n)}`;
+  }
+  return formatInt(n);
+}
+function formatInt(n) {
+  return Math.trunc(n).toString(10);
+}
+function formatResetDuration(reset, now) {
+  if (reset === "") return "";
+  const target = new Date(reset.replace("Z", "+00:00"));
+  if (Number.isNaN(target.getTime())) return "";
+  const diffMs = target.getTime() - now.getTime();
+  if (diffMs <= 0) return "0m";
+  const totalMinutes = Math.trunc(diffMs / 6e4);
+  const days = Math.trunc(totalMinutes / (24 * 60));
+  const hours = Math.trunc(totalMinutes % (24 * 60) / 60);
+  const minutes = totalMinutes % 60;
+  if (days > 0) return `${days}d ${hours}h`;
+  if (hours > 0) return `${hours}h ${pad2(minutes)}m`;
+  return `${minutes}m`;
+}
 
 // src/quotaProbe.ts
 var import_node_fs3 = __toESM(require("node:fs"));
@@ -164,7 +191,7 @@ function parseLanguageServerInfo(psOutput) {
 function parseAgyServerInfos(psOutput) {
   const infos = [];
   for (const line of psOutput.split(/\r?\n/)) {
-    if (!/(^|\s)(?:\/\S+\/)?agy\s+--/.test(line)) {
+    if (!/(^|\s)(?:\/\S+\/)?agy(\s|$)/.test(line)) {
       continue;
     }
     const parts = line.trim().split(/\s+/);
@@ -203,13 +230,21 @@ function buildQuotaCache(rawResponse, now) {
   for (const item of configs) {
     const model = asRecord(item);
     const label = typeof model.label === "string" ? model.label : "";
-    const quotaInfo2 = asRecord(model.quotaInfo);
-    if (label === "" || Object.keys(quotaInfo2).length === 0) {
+    const quotaInfo = asRecord(model.quotaInfo);
+    if (label === "" || Object.keys(quotaInfo).length === 0) {
       continue;
     }
-    const resetTime = typeof quotaInfo2.resetTime === "string" ? quotaInfo2.resetTime : "";
-    const remainingFraction = typeof quotaInfo2.remainingFraction === "number" ? quotaInfo2.remainingFraction : resetTime === "" ? 1 : 0;
-    models[label] = { remainingFraction, resetTime };
+    const resetTime = typeof quotaInfo.resetTime === "string" ? quotaInfo.resetTime : "";
+    const remainingFraction = typeof quotaInfo.remainingFraction === "number" ? quotaInfo.remainingFraction : resetTime === "" ? 1 : 0;
+    const rawBuckets = Array.isArray(quotaInfo.buckets) ? quotaInfo.buckets : [];
+    const buckets = [];
+    for (const b of rawBuckets) {
+      const br = asRecord(b);
+      const brReset = typeof br.resetTime === "string" ? br.resetTime : "";
+      const brRem = typeof br.remainingFraction === "number" ? br.remainingFraction : brReset === "" ? 1 : 0;
+      buckets.push({ remainingFraction: brRem, resetTime: brReset });
+    }
+    models[label] = { remainingFraction, resetTime, buckets };
   }
   if (Object.keys(models).length === 0) {
     return null;
@@ -481,13 +516,13 @@ function render(payload, opts) {
   const modelSegment = renderModelSegment(shortModelName(modelDisplay), payload.plan_tier ?? "", config);
   const ctxPct = contextPercent(payload.context_window);
   const stateLabel = state(payload.agent_state ?? "");
-  const [usagePct, reset, hasQuota] = quotaInfo(opts.quota, modelDisplay, payload.quota);
+  const quotas = getQuotas(opts.quota, modelDisplay, config, opts.now ?? /* @__PURE__ */ new Date(), payload.quota);
   if (config.multiline) {
-    return renderMultiline(payload, config, width, modelSegment, ctxPct, usagePct, reset, hasQuota, opts.gitBranch ?? "", stateLabel);
+    return renderMultiline(payload, config, width, modelSegment, ctxPct, quotas, opts.gitBranch ?? "", stateLabel);
   }
-  return renderSingleLine(payload, config, width, modelSegment, ctxPct, usagePct, reset, hasQuota, stateLabel);
+  return renderSingleLine(payload, config, width, modelSegment, ctxPct, quotas, stateLabel);
 }
-function renderMultiline(payload, config, width, modelSegment, ctxPct, usagePct, reset, hasQuota, branch2, stateLabel) {
+function renderMultiline(payload, config, width, modelSegment, ctxPct, quotas, branch2, stateLabel) {
   const line1Parts = [colorize(modelSegment, colorBlue, config.color)];
   if (config.showCWD && payload.cwd) {
     line1Parts.push(colorize(withIcon(config, "\uF07C ", "") + import_node_path3.default.basename(payload.cwd), colorYellow, config.color));
@@ -509,49 +544,50 @@ function renderMultiline(payload, config, width, modelSegment, ctxPct, usagePct,
   }
   ctx += contextValue(config, payload.context_window, ctxPct);
   let usage2 = "";
-  if (hasQuota) {
-    usage2 = usageLabel(config, usagePct, true);
-    if (reset !== "") {
-      usage2 += resetSuffix(config, reset);
-    }
+  if (quotas.length > 0) {
+    usage2 = joinHeader(...quotas.map((q) => {
+      let u = usageLabel(config, q.usagePct, true, q.label);
+      if (q.reset !== "") u += resetSuffix(config, q.reset);
+      return u;
+    }));
   }
   const stateText = config.showAgentState ? colorize(stateLabel, stateColor(stateLabel), config.color) : "";
   let line2 = joinHeader(ctx, usage2, stateText);
   if (visibleLen(line2) > width) {
     let usageNoBar = "";
-    if (hasQuota) {
-      usageNoBar = usageLabel(config, usagePct, false);
-      if (reset !== "") {
-        usageNoBar += resetSuffix(config, reset);
-      }
+    if (quotas.length > 0) {
+      usageNoBar = joinHeader(...quotas.map((q) => {
+        let u = usageLabel(config, q.usagePct, false, q.label);
+        if (q.reset !== "") u += resetSuffix(config, q.reset);
+        return u;
+      }));
     }
     line2 = joinHeader(`Context ${contextValue(config, payload.context_window, ctxPct)}`, usageNoBar, stateText);
   }
   if (visibleLen(line2) > width) {
     let usageCompact = "";
-    if (hasQuota) {
-      usageCompact = usageLabel(config, usagePct, false);
-      if (reset !== "") {
-        usageCompact += resetSuffix(config, reset);
-      }
+    if (quotas.length > 0) {
+      const q = quotas[0];
+      usageCompact = usageLabel(config, q.usagePct, false, q.label);
+      if (q.reset !== "") usageCompact += resetSuffix(config, q.reset);
     }
-    line2 = joinHeader(`Context ${formatInt(ctxPct)}%`, usageCompact, stateText);
+    line2 = joinHeader(`Context ${formatInt2(ctxPct)}%`, usageCompact, stateText);
   }
   if (visibleLen(line2) > width) {
     let coreUsage = "";
-    if (hasQuota) {
-      coreUsage = `Use ${usageValue(config, usagePct)}`;
+    if (quotas.length > 0) {
+      coreUsage = `Use ${usageValue(config, quotas[0].usagePct)}`;
     }
-    line2 = join(`Ctx ${formatInt(ctxPct)}%`, coreUsage, stateText);
+    line2 = join(`Ctx ${formatInt2(ctxPct)}%`, coreUsage, stateText);
   }
   if (visibleLen(line2) > width) {
-    line2 = join(`${formatInt(ctxPct)}%`, stateText);
+    line2 = join(`${formatInt2(ctxPct)}%`, stateText);
   }
   line2 = fit(line2, width);
   return `${line1}
 ${line2}`;
 }
-function renderSingleLine(payload, config, width, modelSegment, ctxPct, usagePct, reset, hasQuota, stateLabel) {
+function renderSingleLine(payload, config, width, modelSegment, ctxPct, quotas, stateLabel) {
   const coloredBadge = colorize(modelSegment, colorBlue, config.color);
   const ctx = `Ctx ${contextValue(config, payload.context_window, ctxPct)}`;
   let tokens = tokenDetail(payload.context_window);
@@ -561,12 +597,12 @@ function renderSingleLine(payload, config, width, modelSegment, ctxPct, usagePct
     tokens = "";
   }
   let usage2 = "";
-  if (hasQuota) {
-    let text = `Usage ${usageValue(config, usagePct)}`;
-    if (reset !== "") {
-      text += resetSuffix(config, reset);
-    }
-    usage2 = colorize(text, colorMuted, config.color);
+  if (quotas.length > 0) {
+    usage2 = joinHeader(...quotas.map((q) => {
+      let u = usageLabel(config, q.usagePct, true, q.label);
+      if (q.reset !== "") u += resetSuffix(config, q.reset);
+      return u;
+    }));
   }
   const stateText = config.showAgentState ? colorize(stateLabel, stateColor(stateLabel), config.color) : "";
   let bar = "";
@@ -579,7 +615,7 @@ function renderSingleLine(payload, config, width, modelSegment, ctxPct, usagePct
     [coloredBadge, ctx, usage2, stateText],
     [coloredBadge, ctx, stateText],
     [ctx, stateText],
-    [`${formatInt(ctxPct)}%`, stateLabel]
+    [`${formatInt2(ctxPct)}%`, stateLabel]
   ];
   for (const parts of levels) {
     const line = join(...parts);
@@ -587,7 +623,7 @@ function renderSingleLine(payload, config, width, modelSegment, ctxPct, usagePct
       return line;
     }
   }
-  return fit(`${formatInt(ctxPct)}% ${stateLabel}`, width);
+  return fit(`${formatInt2(ctxPct)}% ${stateLabel}`, width);
 }
 function renderModelSegment(shortModel, rawPlan, config) {
   let plan = "Plan ?";
@@ -617,56 +653,66 @@ function renderGitSegment(branch2, config) {
   return `${withIcon(config, "\uE725 ", "")}${branch2}`;
 }
 function resetSuffix(config, reset) {
-  return ` ${withIcon(config, "\u21BB ", "")}Reset ${reset}`;
+  return ` (${withIcon(config, "\u21BB ", "")}${reset})`;
 }
 function withIcon(config, icon, fallback) {
   return config.showIcons ? icon : fallback;
 }
-function quotaInfo(cache, modelDisplay, officialQuota) {
-  const official = officialQuotaInfo(officialQuota, modelDisplay);
+function getQuotas(cache, modelDisplay, config, now, officialQuota) {
+  const official = officialQuotaInfo(officialQuota, modelDisplay, config, now);
   if (official !== null) {
     return official;
   }
   const [quota, ok] = matchModel(cache, modelDisplay);
   if (!ok || quota === null) {
-    return [0, "", false];
+    return [];
+  }
+  if (config.showAllQuotas && Array.isArray(quota.buckets) && quota.buckets.length > 0) {
+    const results = [];
+    for (let i = 0; i < quota.buckets.length; i++) {
+      const b = quota.buckets[i];
+      const uPct = usagePercent(b);
+      const rst = uPct > 0 ? formatReset(b.resetTime, config, now) : "";
+      let label = "Usage ";
+      if (quota.buckets.length === 2) {
+        label = i === 0 ? "Usage " : "Weekly ";
+      }
+      results.push({ label, usagePct: uPct, reset: rst });
+    }
+    return results;
   }
   const usagePct = usagePercent(quota);
-  const reset = usagePct > 0 ? formatResetClock(quota.resetTime) : "";
-  return [usagePct, reset, true];
+  const reset = usagePct > 0 ? formatReset(quota.resetTime, config, now) : "";
+  return [{ label: "Usage ", usagePct, reset }];
 }
-function officialQuotaInfo(officialQuota, modelDisplay) {
-  if (!officialQuota) {
-    return null;
-  }
+function officialQuotaInfo(officialQuota, modelDisplay, config, now) {
+  if (!officialQuota) return null;
   const keys = officialQuotaKeys(modelDisplay);
-  const buckets = [];
+  const results = [];
   let sawKnownBucket = false;
   for (const key of keys) {
-    if (!Object.prototype.hasOwnProperty.call(officialQuota, key)) {
-      continue;
-    }
+    if (!Object.prototype.hasOwnProperty.call(officialQuota, key)) continue;
     sawKnownBucket = true;
     const bucket = officialQuota[key];
     if (Number.isFinite(bucket.remaining_fraction)) {
-      buckets.push(bucket);
+      const usagePct = usagePercent({
+        remainingFraction: bucket.remaining_fraction ?? 1,
+        resetTime: bucket.reset_time ?? ""
+      });
+      const reset = usagePct > 0 ? formatReset(bucket.reset_time ?? "", config, now) : "";
+      let label = "Usage ";
+      if (config.showAllQuotas) {
+        if (key.includes("weekly")) label = "Weekly ";
+      }
+      results.push({ label, usagePct, reset });
     }
   }
-  if (buckets.length === 0) {
-    return sawKnownBucket ? [0, "", false] : null;
+  if (results.length === 0) return sawKnownBucket ? [] : null;
+  if (!config.showAllQuotas) {
+    results[0].label = "Usage ";
+    return [results[0]];
   }
-  let selected = buckets[0];
-  for (const bucket of buckets.slice(1)) {
-    if ((bucket.remaining_fraction ?? 1) < (selected.remaining_fraction ?? 1)) {
-      selected = bucket;
-    }
-  }
-  const usagePct = usagePercent({
-    remainingFraction: selected.remaining_fraction ?? 1,
-    resetTime: selected.reset_time ?? ""
-  });
-  const reset = usagePct > 0 ? formatResetClock(selected.reset_time ?? "") : "";
-  return [usagePct, reset, true];
+  return results;
 }
 function officialQuotaKeys(modelDisplay) {
   const normalized = modelDisplay.toLowerCase();
@@ -683,7 +729,11 @@ function formatResetClock(reset) {
   if (Number.isNaN(target.getTime())) {
     return "";
   }
-  return `${pad2(target.getHours())}:${pad2(target.getMinutes())}`;
+  return `${pad22(target.getHours())}:${pad22(target.getMinutes())}`;
+}
+function formatReset(reset, config, now) {
+  if (config.resetFormat === "duration") return formatResetDuration(reset, now);
+  return formatResetClock(reset);
 }
 function contextValue(config, ctx, pct) {
   const tokens = tokenDetail(ctx);
@@ -695,11 +745,11 @@ function contextValue(config, ctx, pct) {
       break;
     case "both":
       if (tokens !== "") {
-        return `${formatInt(pct)}% ${tokens}`;
+        return `${formatInt2(pct)}% ${tokens}`;
       }
       break;
   }
-  return `${formatInt(pct)}%`;
+  return `${formatInt2(pct)}%`;
 }
 function contextPercent(ctx) {
   const inputTokens = ctx?.total_input_tokens ?? 0;
@@ -713,8 +763,8 @@ function contextPercent(ctx) {
   }
   return clampInt(Math.trunc(upstream + 0.5));
 }
-function usageLabel(config, usagePct, withBar) {
-  let label = "Usage ";
+function usageLabel(config, usagePct, withBar, prefix) {
+  let label = prefix;
   if (withBar && config.showProgressBar) {
     label += `${usageBar(config, usagePct)} `;
   }
@@ -722,18 +772,18 @@ function usageLabel(config, usagePct, withBar) {
 }
 function usageValue(config, usagePct) {
   if (config.usageValue === "remaining") {
-    return `${formatInt(100 - usagePct)}% left`;
+    return `${formatInt2(100 - usagePct)}%`;
   }
-  return `${formatInt(usagePct)}%`;
+  return `${formatInt2(usagePct)}%`;
 }
 function usageBar(config, usagePct) {
   const fillPct = config.usageValue === "remaining" ? 100 - usagePct : usagePct;
   return progressBarWithColor(fillPct, usagePct, 8, config.color);
 }
 function tokenDetail(ctx) {
-  const total = (ctx?.total_input_tokens ?? 0) + (ctx?.total_output_tokens ?? 0);
+  const total = ctx?.total_input_tokens;
   const windowSize = ctx?.context_window_size ?? 0;
-  if (total <= 0 || windowSize <= 0) {
+  if (typeof total !== "number" || total <= 0 || windowSize <= 0) {
     return "";
   }
   return `(${formatTokens(total)}/${formatTokens(windowSize)})`;
@@ -741,14 +791,14 @@ function tokenDetail(ctx) {
 function formatTokens(n) {
   if (n >= 1e6) {
     if (n % 1e6 === 0) {
-      return `${formatInt(n / 1e6)}M`;
+      return `${formatInt2(n / 1e6)}M`;
     }
     return `${Number((n / 1e6).toFixed(1))}M`;
   }
   if (n >= 1e3) {
-    return `${formatInt((n + 500) / 1e3)}k`;
+    return `${formatInt2((n + 500) / 1e3)}k`;
   }
-  return formatInt(n);
+  return formatInt2(n);
 }
 function progressBar(pct, width, color) {
   return progressBarWithColor(pct, pct, width, color);
@@ -819,14 +869,14 @@ function clampInt(n) {
   if (n > 100) return 100;
   return n;
 }
-function formatInt(n) {
+function formatInt2(n) {
   return Math.trunc(n).toString(10);
 }
-function pad2(n) {
+function pad22(n) {
   if (n < 10) {
-    return `0${formatInt(n)}`;
+    return `0${formatInt2(n)}`;
   }
-  return formatInt(n);
+  return formatInt2(n);
 }
 function title(raw) {
   const fields = raw.trim().split(/\s+/).filter(Boolean);
@@ -881,6 +931,11 @@ function configPaths() {
   if (explicit) {
     paths.push(explicit);
   }
+  paths.push(import_node_path4.default.join(process.cwd(), ".agents", "plugins", "agy-hud", "config.json"));
+  const home = import_node_os.default.homedir();
+  if (home) {
+    paths.push(import_node_path4.default.join(home, ".gemini", "config", "plugins", "agy-hud", "config.json"));
+  }
   const dir = import_node_path4.default.dirname(__filename);
   paths.push(import_node_path4.default.join(dir, "config.json"));
   paths.push(import_node_path4.default.join(dir, "..", "config.json"));
@@ -888,7 +943,6 @@ function configPaths() {
   if (xdg) {
     paths.push(import_node_path4.default.join(xdg, "agy-hud", "config.json"));
   }
-  const home = import_node_os.default.homedir();
   if (home) {
     paths.push(import_node_path4.default.join(home, ".config", "agy-hud", "config.json"));
   }
